@@ -1,0 +1,51 @@
+# ─────────────────────────────────────────────
+# ARIA — AmbuAssist  |  .gitignore
+# ─────────────────────────────────────────────
+
+# ── Python virtualenv ─────────────────────────
+ambu-assist/
+.venv/
+venv/
+env/
+
+# ── Python cache ──────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# ── Environment / secrets ─────────────────────
+.env
+.env.*
+!.env.example
+
+# ── Databases (local dev only) ────────────────
+*.db
+*.sqlite
+*.sqlite3
+
+# ── Logs ──────────────────────────────────────
+*.log
+logs/
+
+# ── OS junk ───────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── IDE / editor ──────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ── Test / build artifacts ────────────────────
+.pytest_cache/
+htmlcov/
+.coverage
+dist/
+build/
+*.egg-info/
+
+# ── Stale / leftover dirs ─────────────────────
+backend/src/
