@@ -1,0 +1,31 @@
+# ARIA Backend — core dependencies only
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+python-dotenv>=1.0.0
+pydantic>=2.0.0
+pydantic-settings>=2.0.0
+python-multipart>=0.0.9
+
+# LangChain / LangGraph
+langchain>=0.3.0
+langchain-openai>=0.2.0
+langchain-core>=0.3.0
+langgraph>=0.2.0
+
+# OpenAI
+openai>=1.0.0
+
+# Deepgram STT
+deepgram-sdk>=3.0.0
+
+# Email
+sendgrid>=6.9.0
+
+# HTTP
+httpx>=0.27.0
+aiohttp>=3.9.0
+
+# Utilities
+requests>=2.31.0
+python-dateutil>=2.8.0
+jinja2>=3.1.0
