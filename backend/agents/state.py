@@ -27,6 +27,7 @@ class AgentState(TypedDict):
     # Output
     response_text: str                          # What ARIA says next → sent to TTS
     display_data: Optional[dict]                # Extra data for frontend UI panels
+    response_chunks: Optional[list]             # Optional streaming-style chunks
 
     # Error
     error: Optional[str]

@@ -4,7 +4,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Separator } from '@/components/ui/separator'
 import { TooltipProvider, Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip'
-import { sendMessage, resetConversation, getStatus } from '@/api/client'
+import { chatStream, resetConversation, getStatus } from '@/api/client'
 import { playAudio, stopAudio } from '@/utils/audio'
 import useStore from '@/store/useStore'
 import { Send, Mic, MicOff, Loader2, RotateCcw, Radio } from 'lucide-react'
@@ -64,30 +64,116 @@ export default function ChatPanel() {
     if (!msg) return
     addMessageRef.current('user', msg)
     setLoadingRef.current(true)
-    try {
-      const res  = await sendMessage(msg, sessionIdRef.current)
-      const data = res.data
-      addMessageRef.current('assistant', data.response)
-      setFormRef.current({
-        activeForm:          data.active_form,
-        formData:            data.form_data || {},
-        confirmationPending: data.confirmation_pending,
-        submitted:           data.submitted,
-      })
-      if (data.submitted || data.intent === 'update_checklist') {
-        getStatus(sessionIdRef.current)
-          .then(r => setStatusRef.current(r.data.status_items))
-          .catch(() => {})
-      }
-      if (data.audio_base64 && !isRecordingRef.current) {
+
+    const wait = (ms) => new Promise(resolve => setTimeout(resolve, ms))
+
+    const playChunksSequentially = async (chunkList = []) => {
+      for (let i = 0; i < chunkList.length; i++) {
+        const chunk = chunkList[i]
+        const audioBase64 = chunk?.audio_base64
+        if (isRecordingRef.current) break
+        if (!audioBase64) continue
         const ctrl = playAudio(
-          data.audio_base64,
+          audioBase64,
           () => setSpeakingRef.current(true),
           () => setSpeakingRef.current(false),
         )
         await ctrl.promise
+        if (i < chunkList.length - 1 && !isRecordingRef.current) {
+          await wait(350)
+        }
       }
-    } catch {
+    }
+
+    const handleAssistantEvent = async (payload) => {
+      if (!payload) return
+      const chunks = Array.isArray(payload.response_chunks) ? payload.response_chunks : []
+      const chunkTexts = chunks
+        .map(chunk => (chunk?.text || '').trim())
+        .filter(Boolean)
+
+      if (payload.type === 'speculative') {
+        if (chunkTexts.length) {
+          chunkTexts.forEach(text => addMessageRef.current('assistant', text))
+        } else if (payload.response) {
+          addMessageRef.current('assistant', payload.response)
+        }
+        if (!isRecordingRef.current) {
+          await playChunksSequentially(chunks)
+        }
+        return
+      }
+
+      if (payload.type === 'final') {
+        if (chunkTexts.length) {
+          chunkTexts.forEach(text => addMessageRef.current('assistant', text))
+        } else if (payload.response) {
+          addMessageRef.current('assistant', payload.response)
+        }
+        setFormRef.current({
+          activeForm:          payload.active_form,
+          formData:            payload.form_data || {},
+          confirmationPending: payload.confirmation_pending,
+          submitted:           payload.submitted,
+        })
+        if (payload.submitted || payload.intent === 'update_checklist') {
+          getStatus(sessionIdRef.current)
+            .then(r => setStatusRef.current(r.data.status_items))
+            .catch(() => {})
+        }
+        if (!isRecordingRef.current) {
+          if (chunks.length) {
+            await playChunksSequentially(chunks)
+          } else if (payload.audio_base64) {
+            const ctrl = playAudio(
+              payload.audio_base64,
+              () => setSpeakingRef.current(true),
+              () => setSpeakingRef.current(false),
+            )
+            await ctrl.promise
+          }
+        }
+        return
+      }
+
+      if (payload.type === 'error') {
+        addMessageRef.current('assistant', payload.response || 'Something went wrong. Please try again.')
+      }
+    }
+
+    try {
+      const response = await chatStream(msg, sessionIdRef.current)
+      if (!response.ok || !response.body) throw new Error('chat stream failed')
+
+      const reader = response.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+      let pending = Promise.resolve()
+
+      while (true) {
+        const { value, done } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+        const events = buffer.split('\n\n')
+        buffer = events.pop() || ''
+        for (const evt of events) {
+          const line = evt.trim()
+          if (!line.startsWith('data:')) continue
+          const jsonStr = line.slice(5).trim()
+          if (!jsonStr) continue
+          let payload
+          try {
+            payload = JSON.parse(jsonStr)
+          } catch {
+            continue
+          }
+          pending = pending.then(() => handleAssistantEvent(payload))
+        }
+      }
+
+      await pending
+    } catch (err) {
+      console.error(err)
       addMessageRef.current('assistant', 'Something went wrong. Please try again.')
     } finally {
       setLoadingRef.current(false)

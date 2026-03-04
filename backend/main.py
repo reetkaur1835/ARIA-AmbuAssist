@@ -6,6 +6,7 @@ import os
 import sys
 import json
 import asyncio
+import random
 from contextlib import asynccontextmanager
 from datetime import date
 
@@ -17,6 +18,7 @@ load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from database.setup import init_db
@@ -25,6 +27,7 @@ from auth.session import (
     get_current_paramedic, end_session,
 )
 from agents.graph import aria_graph
+from agents.schedule_agent import FILLER_OPENERS
 from agents.state import AgentState
 from services.tts import text_to_speech_base64
 from tools.db_tools import get_paramedic_status, get_upcoming_shifts, get_submissions_for_medic
@@ -75,6 +78,7 @@ def get_or_init_state(session_id: str, paramedic: dict) -> dict:
             "submitted": False,
             "response_text": "",
             "display_data": None,
+            "response_chunks": [],
             "error": None,
         }
     else:
@@ -145,8 +149,24 @@ async def me(req: MeRequest):
 
 
 # ─────────────────────────────────────────────
-# CHAT ROUTE
+# CHAT ROUTE (SSE streaming)
 # ─────────────────────────────────────────────
+
+def _build_filler_phrase(paramedic: dict) -> str:
+    opener = random.choice(FILLER_OPENERS)
+    station = paramedic.get("station")
+    today_str = date.today().strftime("%b %d, %Y")
+    fragments = []
+    if station:
+        fragments.append(f"for {station}")
+    fragments.append(f"on {today_str}")
+    detail = " and ".join(fragments)
+    return f"{opener}, {detail}..."
+
+
+def _sse(data: dict) -> bytes:
+    return f"data: {json.dumps(data, ensure_ascii=False)}\n\n".encode("utf-8")
+
 
 @app.post("/api/chat")
 async def chat(req: ChatRequest):
@@ -163,55 +183,101 @@ async def chat(req: ChatRequest):
     state["confirmed"] = False
     state["error"] = None
 
-    # Run the graph
-    try:
-        result = await aria_graph.ainvoke(state)
-    except Exception as e:
-        error_msg = f"Something went wrong on my end. Try again? ({str(e)[:80]})"
-        return {
-            "response": error_msg,
-            "audio_base64": "",
-            "intent": state.get("intent"),
-            "active_form": state.get("active_form"),
-            "form_data": state.get("form_data", {}),
-            "required_fields": state.get("required_fields", []),
-            "missing_fields": state.get("missing_fields", []),
-            "confirmation_pending": state.get("confirmation_pending", False),
-            "submitted": False,
-            "display_data": None,
+    async def event_stream():
+        filler_text = _build_filler_phrase(paramedic)
+        filler_audio = ""
+        try:
+            filler_audio = await text_to_speech_base64(filler_text)
+        except Exception:
+            filler_audio = ""
+
+        filler_chunk = {
+            "id": "speculative",
+            "type": "speculative",
+            "text": filler_text,
+            "metadata": {"intent": state.get("intent")},
+        }
+        filler_chunk["audio_base64"] = filler_audio
+
+        yield _sse({
+            "type": "speculative",
+            "response": filler_text,
+            "audio_base64": filler_audio,
+            "response_chunks": [filler_chunk],
+        })
+
+        try:
+            result = await aria_graph.ainvoke(state)
+        except Exception as e:
+            error_msg = f"Something went wrong on my end. Try again? ({str(e)[:80]})"
+            yield _sse({
+                "type": "error",
+                "response": error_msg,
+                "audio_base64": "",
+                "response_chunks": [],
+            })
+            return
+
+        for key, value in result.items():
+            state[key] = value
+        if "messages" in result:
+            state["messages"] = result["messages"]
+
+        response_text = result.get("response_text", "")
+        response_chunks = result.get("response_chunks") or state.get("response_chunks") or []
+        response_chunks = list(response_chunks) if response_chunks else []
+        state["response_chunks"] = []
+
+        async def _tts(text: str) -> str:
+            try:
+                return await text_to_speech_base64(text)
+            except Exception:
+                return ""
+
+        async def synthesize_chunks(chunks: list[dict]) -> list[dict]:
+            if not chunks:
+                return []
+            tasks = [asyncio.create_task(_tts(chunk.get("text", ""))) for chunk in chunks]
+            audio_segments = await asyncio.gather(*tasks)
+            enriched = []
+            for chunk, audio in zip(chunks, audio_segments):
+                enriched.append({**chunk, "audio_base64": audio})
+            return enriched
+
+        chunks_for_tts = response_chunks
+        if not chunks_for_tts and response_text:
+            chunks_for_tts = [{
+                "type": "final",
+                "text": response_text,
+                "metadata": {"intent": state.get("intent")},
+            }]
+
+        chunk_payloads = await synthesize_chunks(chunks_for_tts)
+        chunk_payloads = [c for c in chunk_payloads if c.get("type") != "speculative"]
+
+        if not response_text and chunks_for_tts:
+            response_text = " ".join(filter(None, (chunk.get("text", "") for chunk in chunks_for_tts)))
+
+        audio_base64 = chunk_payloads[-1]["audio_base64"] if chunk_payloads else ""
+
+        payload = {
+            "type": "final",
+            "response":            response_text,
+            "audio_base64":        audio_base64,
+            "response_chunks":     chunk_payloads,
+            "intent":              result.get("intent"),
+            "active_form":         result.get("active_form"),
+            "form_data":           result.get("form_data", {}),
+            "required_fields":     result.get("required_fields", []),
+            "missing_fields":      result.get("missing_fields", []),
+            "confirmation_pending": result.get("confirmation_pending", False),
+            "submitted":           result.get("submitted", False),
+            "display_data":        result.get("display_data"),
         }
 
-    # Merge result back into session state
-    # Always update every key that came back from the graph
-    for key, value in result.items():
-        state[key] = value
-    # Keep messages as the full accumulated list (LangGraph returns the full list)
-    if "messages" in result:
-        state["messages"] = result["messages"]
+        yield _sse(payload)
 
-    response_text = result.get("response_text", "")
-
-    # Generate TTS audio in parallel with building the response dict
-    async def _tts(text: str) -> str:
-        try:
-            return await text_to_speech_base64(text)
-        except Exception:
-            return ""
-
-    audio_base64 = await _tts(response_text) if response_text else ""
-
-    return {
-        "response":            response_text,
-        "audio_base64":        audio_base64,
-        "intent":              result.get("intent"),
-        "active_form":         result.get("active_form"),
-        "form_data":           result.get("form_data", {}),
-        "required_fields":     result.get("required_fields", []),
-        "missing_fields":      result.get("missing_fields", []),
-        "confirmation_pending": result.get("confirmation_pending", False),
-        "submitted":           result.get("submitted", False),
-        "display_data":        result.get("display_data"),
-    }
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
 # ─────────────────────────────────────────────

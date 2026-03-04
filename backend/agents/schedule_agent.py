@@ -4,6 +4,7 @@ Queries paramedic_shifts.db and answers schedule questions.
 Also handles Shift Change Requests.
 """
 import json
+import random
 from datetime import date, datetime
 from agents.state import AgentState
 from services.llm import get_voice_llm, get_extraction_llm
@@ -62,6 +63,44 @@ Extract any of:
 
 Respond ONLY with valid JSON:
 {{"extracted_fields": {{"field": "value"}}, "confidence": {{"field": "HIGH|MEDIUM|LOW"}}}}"""
+
+FILLER_OPENERS = [
+    "Let me check that quickly",
+    "Give me a second to pull that up",
+    "Hang tight while I peek at scheduling",
+    "One moment while I double-check the roster",
+]
+
+
+def _friendly_date(iso_date: str | None) -> str | None:
+    if not iso_date:
+        return None
+    try:
+        parsed = datetime.fromisoformat(iso_date)
+        return parsed.strftime("%b %d, %Y")
+    except Exception:
+        return iso_date
+
+
+def _build_speculative_phrase(station: str | None, date_hint: str | None, medic_label: str) -> str:
+    opener = random.choice(FILLER_OPENERS)
+    fragments = []
+    if station:
+        fragments.append(f"for {station}")
+    friendly_date = _friendly_date(date_hint)
+    if friendly_date:
+        fragments.append(f"on {friendly_date}")
+    detail = " and ".join(fragments)
+    if detail:
+        return f"{opener}, {detail}..."
+    if medic_label:
+        return f"{opener}, {medic_label}..."
+    return f"{opener}..."
+
+
+def _assemble_chunk_text(chunks: list[dict]) -> str:
+    parts = [chunk.get("text", "").strip() for chunk in chunks if chunk.get("text")]
+    return " ".join(parts).strip()
 
 
 async def schedule_agent_node(state: AgentState) -> dict:
@@ -193,6 +232,24 @@ async def schedule_agent_node(state: AgentState) -> dict:
         limit=14,
     )
 
+    response_chunks: list[dict] = []
+    filler_text = _build_speculative_phrase(
+        station or (shifts[0]["station"] if shifts and shifts[0].get("station") else None),
+        date_from,
+        full_name or medic_num,
+    )
+    if filler_text:
+        response_chunks.append({
+            "id": "speculative",
+            "type": "speculative",
+            "text": filler_text,
+            "metadata": {
+                "intent": intent,
+                "station": station,
+                "date_hint": date_from,
+            },
+        })
+
     try:
         result = await call_llm_json(
             get_voice_llm(),
@@ -214,11 +271,24 @@ async def schedule_agent_node(state: AgentState) -> dict:
         else:
             response_text = "I couldn't find any upcoming shifts for you in the system."
 
+    response_chunks.append({
+        "id": "final",
+        "type": "final",
+        "text": response_text,
+        "metadata": {
+            "intent": intent,
+            "has_data": bool(shifts),
+        },
+    })
+
+    combined_response = _assemble_chunk_text(response_chunks) or response_text
+
     return {
         "active_form": None,
-        "response_text": response_text,
+        "response_text": combined_response,
         "display_data": {"shifts": shifts},
-        "messages": [{"role": "assistant", "content": response_text}],
+        "response_chunks": response_chunks,
+        "messages": [{"role": "assistant", "content": combined_response}],
     }
 
 
