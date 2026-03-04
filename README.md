@@ -87,6 +87,15 @@ uvicorn main:app --reload --host 0.0.0.0 --port 8000
 
 API docs available at: `http://localhost:8000/docs`
 
+### 6. Run the frontend (Vite)
+```bash
+cd frontend
+npm install
+npm run dev -- --host
+```
+
+The Vite dev server listens on `http://localhost:5173/` and will also expose your LAN IP when launched with `--host`, which is handy for testing on tablets in the bay. The React client assumes the FastAPI backend is on `http://localhost:8000`; update `frontend/src/api/client.js` if you proxy requests elsewhere.
+
 ---
 
 ## Environment Variables
@@ -103,25 +112,58 @@ See `.env.example` for all required keys:
 
 ---
 
+## Streaming Latency Model
+
+`POST /api/chat` replies as a **Server-Sent Events (SSE)** stream. Every turn emits:
+
+1. **Speculative chunk** — instant filler phrase generated locally (e.g., “Hang tight while I peek at scheduling…”). Its TTS audio is synthesized immediately and flushed so the UI can play it under 500 ms.
+2. **Final chunk** — streamed after LangGraph produces the answer. Contains the full response, structured data (`display_data`, `form_data`, etc.), and the final TTS audio.
+
+Client integration tips:
+- Use `fetch('/api/chat', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({...}) })` and parse `data: { ... }` events from the response stream.
+- Handle `type: "speculative"`, `type: "final"`, and `type: "error"` events separately.
+- Audio arrives Base64-encoded per chunk; render or play it as each event lands—no extra polling endpoints needed.
+
+This architecture keeps perceived latency low while the heavier LLM turn finishes in the background.
+
+---
+
 ## Project Structure
 
 ```
 ARIA-AmbuAssist/
 ├── backend/
-│   ├── main.py              # FastAPI app + all routes
-│   ├── agents/              # LangGraph agent nodes
-│   │   ├── delegator.py     # Intent classifier / router
-│   │   ├── schedule_agent.py
-│   │   ├── checklist_agent.py
-│   │   ├── occurrence_agent.py
-│   │   ├── teddy_bear_agent.py
-│   │   ├── general_agent.py
-│   │   └── graph.py         # LangGraph StateGraph definition
+│   ├── main.py              # FastAPI app + SSE /api/chat endpoint
+│   ├── agents/              # LangGraph nodes + routing logic
 │   ├── services/            # LLM, TTS, STT clients
-│   ├── forms/               # Email rendering + sending
-│   ├── tools/               # DB tools, weather tool
-│   ├── auth/                # Session management
-│   └── database/            # Schema + seed data
+│   ├── forms/               # Email rendering + sending logic
+│   ├── tools/               # DB helpers + weather tool
+│   ├── auth/                # Session management helpers
+│   └── database/            # Schema + migrations + seed data
+├── frontend/
+│   ├── src/
+│   │   ├── main.jsx         # Vite entry; mounts providers + <App />
+│   │   ├── App.jsx          # Layout shell (panels + providers)
+│   │   ├── api/
+│   │   │   └── client.js    # `chatStream()` SSE fetch helper
+│   │   ├── components/
+│   │   │   ├── ChatPanel.jsx    # Streams SSE, renders/speculative audio
+│   │   │   ├── LeftPanel.jsx    # User/session metadata
+│   │   │   ├── RightPanel.jsx   # Forms + structured data display
+│   │   │   ├── ModeToggle.jsx   # Theme switcher
+│   │   │   └── ui/              # Reusable primitives (Button, Card, etc.)
+│   │   ├── store/
+│   │   │   └── useStore.js  # Zustand store tracking chat + audio queue
+│   │   ├── utils/
+│   │   │   └── audio.js     # Web Audio helpers (decode, queue playback)
+│   │   └── lib/
+│   │       └── utils.js     # Tailwind/class helpers
+│   ├── public/
+│   │   └── pcm-processor.js # AudioWorklet for PCM streaming
+│   ├── App.css / index.css  # Global styles + layout tokens
+│   ├── package.json         # Frontend deps + scripts
+│   ├── vite.config.js       # Dev server + proxy tuning
+│   └── README.md            # Frontend-specific notes
 ├── .env.example
 └── README.md
 ```
